@@ -79,6 +79,7 @@ class Detr(nn.Module):
 
         self.num_classes = cfg.MODEL.DETR.NUM_CLASSES
         self.mask_on = cfg.MODEL.MASK_ON
+        self.threshold = cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST
         hidden_dim = cfg.MODEL.DETR.HIDDEN_DIM
         num_queries = cfg.MODEL.DETR.NUM_OBJECT_QUERIES
         # Transformer parameters:
@@ -190,7 +191,7 @@ class Detr(nn.Module):
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
             mask_pred = output["pred_masks"] if self.mask_on else None
-            results = self.inference(box_cls, box_pred, mask_pred, images.image_sizes)
+            results = self.inference(box_cls, box_pred, mask_pred, images.image_sizes, self.threshold)
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
                 height = input_per_image.get("height", image_size[0])
@@ -214,7 +215,7 @@ class Detr(nn.Module):
                 new_targets[-1].update({'masks': gt_masks})
         return new_targets
 
-    def inference(self, box_cls, box_pred, mask_pred, image_sizes):
+    def inference(self, box_cls, box_pred, mask_pred, image_sizes, threshold = 0.5):
         """
         Arguments:
             box_cls (Tensor): tensor of shape (batch_size, num_queries, K).
@@ -236,19 +237,22 @@ class Detr(nn.Module):
         for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(zip(
             scores, labels, box_pred, image_sizes
         )):
+            thresholded_output_mask = scores_per_image > threshold
+
             result = Instances(image_size)
-            result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
+            result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image[thresholded_output_mask]))
 
             result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
             if self.mask_on:
                 mask = F.interpolate(mask_pred[i].unsqueeze(0), size=image_size, mode='bilinear', align_corners=False)
+                mask = mask[:, thresholded_output_mask, :, :]
                 mask = mask[0].sigmoid() > 0.5
                 B, N, H, W = mask_pred.shape
                 mask = BitMasks(mask.cpu()).crop_and_resize(result.pred_boxes.tensor.cpu(), 32)
                 result.pred_masks = mask.unsqueeze(1).to(mask_pred[0].device)
 
-            result.scores = scores_per_image
-            result.pred_classes = labels_per_image
+            result.scores = scores_per_image[thresholded_output_mask]
+            result.pred_classes = labels_per_image[thresholded_output_mask]
             results.append(result)
         return results
 
